@@ -8,12 +8,11 @@
 #ifndef LIB_JXL_JPEG_DEC_JPEG_DATA_WRITER_H_
 #define LIB_JXL_JPEG_DEC_JPEG_DATA_WRITER_H_
 
-#include <stddef.h>
-#include <stdint.h>
-
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 
-#include "lib/jxl/codec_in_out.h"
+#include "lib/jxl/base/status.h"
 #include "lib/jxl/jpeg/jpeg_data.h"
 
 namespace jxl {
@@ -24,9 +23,6 @@ namespace jpeg {
 using JPEGOutput = std::function<size_t(const uint8_t* buf, size_t len)>;
 
 Status WriteJpeg(const JPEGData& jpg, const JPEGOutput& out);
-
-// Reconstructs the JPEG from the coefficients and metadata in CodecInOut.
-Status EncodeImageJPGCoefficients(const CodecInOut* io, PaddedBytes* bytes);
 
 }  // namespace jpeg
 }  // namespace jxl

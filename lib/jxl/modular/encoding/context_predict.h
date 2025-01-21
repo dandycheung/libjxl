@@ -6,10 +6,19 @@
 #ifndef LIB_JXL_MODULAR_ENCODING_CONTEXT_PREDICT_H_
 #define LIB_JXL_MODULAR_ENCODING_CONTEXT_PREDICT_H_
 
-#include <utility>
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <vector>
 
+#include "lib/jxl/base/bits.h"
+#include "lib/jxl/base/compiler_specific.h"
+#include "lib/jxl/base/status.h"
+#include "lib/jxl/field_encodings.h"
 #include "lib/jxl/fields.h"
+#include "lib/jxl/image_ops.h"
 #include "lib/jxl/modular/modular_image.h"
 #include "lib/jxl/modular/options.h"
 
@@ -32,11 +41,11 @@ struct Header : public Fields {
       visitor->SetDefault(this);
       return true;
     }
-    auto visit_p = [visitor](pixel_type val, pixel_type *p) {
+    auto visit_p = [visitor](pixel_type val, pixel_type *p) -> Status {
       uint32_t up = *p;
       JXL_QUIET_RETURN_IF_ERROR(visitor->Bits(5, val, &up));
       *p = up;
-      return Status(true);
+      return true;
     };
     JXL_QUIET_RETURN_IF_ERROR(visit_p(16, &p1C));
     JXL_QUIET_RETURN_IF_ERROR(visit_p(10, &p2C));
@@ -62,26 +71,32 @@ struct State {
   pixel_type_w pred = 0;  // *before* removing the added bits.
   std::vector<uint32_t> pred_errors[kNumPredictors];
   std::vector<int32_t> error;
-  Header header;
+  const Header &header;
 
   // Allows to approximate division by a number from 1 to 64.
-  uint32_t divlookup[64];
+  //  for (int i = 0; i < 64; i++) divlookup[i] = (1 << 24) / (i + 1);
+
+  const uint32_t divlookup[64] = {
+      16777216, 8388608, 5592405, 4194304, 3355443, 2796202, 2396745, 2097152,
+      1864135,  1677721, 1525201, 1398101, 1290555, 1198372, 1118481, 1048576,
+      986895,   932067,  883011,  838860,  798915,  762600,  729444,  699050,
+      671088,   645277,  621378,  599186,  578524,  559240,  541200,  524288,
+      508400,   493447,  479349,  466033,  453438,  441505,  430185,  419430,
+      409200,   399457,  390167,  381300,  372827,  364722,  356962,  349525,
+      342392,   335544,  328965,  322638,  316551,  310689,  305040,  299593,
+      294337,   289262,  284359,  279620,  275036,  270600,  266305,  262144};
 
   constexpr static pixel_type_w AddBits(pixel_type_w x) {
-    return uint64_t(x) << kPredExtraBits;
+    return static_cast<uint64_t>(x) << kPredExtraBits;
   }
 
-  State(Header header, size_t xsize, size_t ysize) : header(header) {
+  State(const Header &header, size_t xsize, size_t ysize) : header(header) {
     // Extra margin to avoid out-of-bounds writes.
     // All have space for two rows of data.
-    for (size_t i = 0; i < 4; i++) {
-      pred_errors[i].resize((xsize + 2) * 2);
+    for (auto &pred_error : pred_errors) {
+      pred_error.resize((xsize + 2) * 2);
     }
     error.resize((xsize + 2) * 2);
-    // Initialize division lookup table.
-    for (int i = 0; i < 64; i++) {
-      divlookup[i] = (1 << 24) / (i + 1);
-    }
   }
 
   // Approximates 4+(maxweight<<24)/(x+1), avoiding division
@@ -282,15 +297,15 @@ struct FlatDecisionNode {
     PropertyVal splitval0;
     Predictor predictor;
   };
-  uint32_t childID;  // childID is ctx id if leaf.
   // Property+splitval of the two child nodes.
   union {
     PropertyVal splitvals[2];
     int32_t multiplier;
   };
+  uint32_t childID;  // childID is ctx id if leaf.
   union {
-    int32_t properties[2];
-    int64_t predictor_offset;
+    int16_t properties[2];
+    int32_t predictor_offset;
   };
 };
 using FlatTree = std::vector<FlatDecisionNode>;
@@ -301,22 +316,27 @@ class MATreeLookup {
   struct LookupResult {
     uint32_t context;
     Predictor predictor;
-    int64_t offset;
+    int32_t offset;
     int32_t multiplier;
   };
-  LookupResult Lookup(const Properties &properties) const {
+  JXL_INLINE LookupResult Lookup(const Properties &properties) const {
     uint32_t pos = 0;
     while (true) {
-      const FlatDecisionNode &node = nodes_[pos];
-      if (node.property0 < 0) {
-        return {node.childID, node.predictor, node.predictor_offset,
-                node.multiplier};
-      }
-      bool p0 = properties[node.property0] <= node.splitval0;
-      uint32_t off0 = properties[node.properties[0]] <= node.splitvals[0];
-      uint32_t off1 =
-          2 | (properties[node.properties[1]] <= node.splitvals[1] ? 1 : 0);
-      pos = node.childID + (p0 ? off1 : off0);
+#define TRAVERSE_THE_TREE                                                      \
+  {                                                                            \
+    const FlatDecisionNode &node = nodes_[pos];                                \
+    if (node.property0 < 0) {                                                  \
+      return {node.childID, node.predictor, node.predictor_offset,             \
+              node.multiplier};                                                \
+    }                                                                          \
+    bool p0 = properties[node.property0] <= node.splitval0;                    \
+    uint32_t off0 = properties[node.properties[0]] <= node.splitvals[0];       \
+    uint32_t off1 = 2 | (properties[node.properties[1]] <= node.splitvals[1]); \
+    pos = node.childID + (p0 ? off1 : off0);                                   \
+  }
+
+      TRAVERSE_THE_TREE;
+      TRAVERSE_THE_TREE;
     }
   }
 
@@ -416,6 +436,7 @@ enum PredictorMode {
   kUseWP = 2,
   kForceComputeProperties = 4,
   kAllPredictions = 8,
+  kNoEdgeCases = 16
 };
 
 JXL_INLINE pixel_type_w PredictOne(Predictor p, pixel_type_w left,
@@ -461,7 +482,7 @@ JXL_INLINE pixel_type_w PredictOne(Predictor p, pixel_type_w left,
 }
 
 template <int mode>
-inline PredictionResult Predict(
+JXL_INLINE PredictionResult Predict(
     Properties *p, size_t w, const pixel_type *JXL_RESTRICT pp,
     const intptr_t onerow, const size_t x, const size_t y, Predictor predictor,
     const MATreeLookup *lookup, const Channel *references,
@@ -470,20 +491,22 @@ inline PredictionResult Predict(
   size_t offset = 3;
   constexpr bool compute_properties =
       mode & kUseTree || mode & kForceComputeProperties;
-  pixel_type_w left = (x ? pp[-1] : (y ? pp[-onerow] : 0));
-  pixel_type_w top = (y ? pp[-onerow] : left);
-  pixel_type_w topleft = (x && y ? pp[-1 - onerow] : left);
-  pixel_type_w topright = (x + 1 < w && y ? pp[1 - onerow] : top);
-  pixel_type_w leftleft = (x > 1 ? pp[-2] : left);
-  pixel_type_w toptop = (y > 1 ? pp[-onerow - onerow] : top);
-  pixel_type_w toprightright = (x + 2 < w && y ? pp[2 - onerow] : topright);
+  constexpr bool nec = mode & kNoEdgeCases;
+  pixel_type_w left = (nec || x ? pp[-1] : (y ? pp[-onerow] : 0));
+  pixel_type_w top = (nec || y ? pp[-onerow] : left);
+  pixel_type_w topleft = (nec || (x && y) ? pp[-1 - onerow] : left);
+  pixel_type_w topright = (nec || (x + 1 < w && y) ? pp[1 - onerow] : top);
+  pixel_type_w leftleft = (nec || x > 1 ? pp[-2] : left);
+  pixel_type_w toptop = (nec || y > 1 ? pp[-onerow - onerow] : top);
+  pixel_type_w toprightright =
+      (nec || (x + 2 < w && y) ? pp[2 - onerow] : topright);
 
   if (compute_properties) {
     // location
     (*p)[offset++] = x;
     // neighbors
-    (*p)[offset++] = std::abs(top);
-    (*p)[offset++] = std::abs(left);
+    (*p)[offset++] = top > 0 ? top : -top;
+    (*p)[offset++] = left > 0 ? left : -left;
     (*p)[offset++] = top;
     (*p)[offset++] = left;
 
@@ -506,7 +529,7 @@ inline PredictionResult Predict(
     wp_pred = wp_state->Predict<compute_properties>(
         x, y, w, top, left, topright, topleft, toptop, p, offset);
   }
-  if (compute_properties) {
+  if (!nec && compute_properties) {
     offset += weighted::kNumProperties;
     // Extra properties.
     const pixel_type *JXL_RESTRICT rp = references->Row(x);
@@ -524,8 +547,9 @@ inline PredictionResult Predict(
   }
   if (mode & kAllPredictions) {
     for (size_t i = 0; i < kNumModularPredictors; i++) {
-      predictions[i] = PredictOne((Predictor)i, left, top, toptop, topleft,
-                                  topright, leftleft, toprightright, wp_pred);
+      predictions[i] =
+          PredictOne(static_cast<Predictor>(i), left, top, toptop, topleft,
+                     topright, leftleft, toprightright, wp_pred);
     }
   }
   result.guess += PredictOne(predictor, left, top, toptop, topleft, topright,
@@ -565,6 +589,15 @@ inline PredictionResult PredictTreeNoWP(Properties *p, size_t w,
       p, w, pp, onerow, x, y, Predictor::Zero, &tree_lookup, &references,
       /*wp_state=*/nullptr, /*predictions=*/nullptr);
 }
+// Only use for y > 1, x > 1, x < w-2, and empty references
+JXL_INLINE PredictionResult
+PredictTreeNoWPNEC(Properties *p, size_t w, const pixel_type *JXL_RESTRICT pp,
+                   const intptr_t onerow, const int x, const int y,
+                   const MATreeLookup &tree_lookup, const Channel &references) {
+  return detail::Predict<detail::kUseTree | detail::kNoEdgeCases>(
+      p, w, pp, onerow, x, y, Predictor::Zero, &tree_lookup, &references,
+      /*wp_state=*/nullptr, /*predictions=*/nullptr);
+}
 
 inline PredictionResult PredictTreeWP(Properties *p, size_t w,
                                       const pixel_type *JXL_RESTRICT pp,
@@ -574,6 +607,18 @@ inline PredictionResult PredictTreeWP(Properties *p, size_t w,
                                       const Channel &references,
                                       weighted::State *wp_state) {
   return detail::Predict<detail::kUseTree | detail::kUseWP>(
+      p, w, pp, onerow, x, y, Predictor::Zero, &tree_lookup, &references,
+      wp_state, /*predictions=*/nullptr);
+}
+JXL_INLINE PredictionResult PredictTreeWPNEC(Properties *p, size_t w,
+                                             const pixel_type *JXL_RESTRICT pp,
+                                             const intptr_t onerow, const int x,
+                                             const int y,
+                                             const MATreeLookup &tree_lookup,
+                                             const Channel &references,
+                                             weighted::State *wp_state) {
+  return detail::Predict<detail::kUseTree | detail::kUseWP |
+                         detail::kNoEdgeCases>(
       p, w, pp, onerow, x, y, Predictor::Zero, &tree_lookup, &references,
       wp_state, /*predictions=*/nullptr);
 }
@@ -597,6 +642,29 @@ inline void PredictLearnAll(Properties *p, size_t w,
                             pixel_type_w *predictions) {
   detail::Predict<detail::kForceComputeProperties | detail::kUseWP |
                   detail::kAllPredictions>(
+      p, w, pp, onerow, x, y, Predictor::Zero,
+      /*lookup=*/nullptr, &references, wp_state, predictions);
+}
+inline PredictionResult PredictLearnNEC(Properties *p, size_t w,
+                                        const pixel_type *JXL_RESTRICT pp,
+                                        const intptr_t onerow, const int x,
+                                        const int y, Predictor predictor,
+                                        const Channel &references,
+                                        weighted::State *wp_state) {
+  return detail::Predict<detail::kForceComputeProperties | detail::kUseWP |
+                         detail::kNoEdgeCases>(
+      p, w, pp, onerow, x, y, predictor, /*lookup=*/nullptr, &references,
+      wp_state, /*predictions=*/nullptr);
+}
+
+inline void PredictLearnAllNEC(Properties *p, size_t w,
+                               const pixel_type *JXL_RESTRICT pp,
+                               const intptr_t onerow, const int x, const int y,
+                               const Channel &references,
+                               weighted::State *wp_state,
+                               pixel_type_w *predictions) {
+  detail::Predict<detail::kForceComputeProperties | detail::kUseWP |
+                  detail::kAllPredictions | detail::kNoEdgeCases>(
       p, w, pp, onerow, x, y, Predictor::Zero,
       /*lookup=*/nullptr, &references, wp_state, predictions);
 }

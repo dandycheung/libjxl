@@ -8,14 +8,15 @@
 
 // Holds inputs/outputs for decoding/encoding images.
 
-#include <stddef.h>
+#include <jxl/memory_manager.h>
 
+#include <cstddef>
+#include <cstdint>
 #include <utility>
 #include <vector>
 
-#include "lib/jxl/base/data_parallel.h"
-#include "lib/jxl/common.h"
-#include "lib/jxl/frame_header.h"
+#include "lib/jxl/base/status.h"
+#include "lib/jxl/color_encoding_internal.h"
 #include "lib/jxl/headers.h"
 #include "lib/jxl/image.h"
 #include "lib/jxl/image_bundle.h"
@@ -23,59 +24,24 @@
 
 namespace jxl {
 
-// Per-channel interval, used to convert between (full-range) external and
-// (bounded or unbounded) temp values. See external_image.cc for the definitions
-// of temp/external.
-struct CodecInterval {
-  CodecInterval() = default;
-  constexpr CodecInterval(float min, float max) : min(min), width(max - min) {}
-  // Defaults for temp.
-  float min = 0.0f;
-  float width = 1.0f;
-};
-
-struct SizeConstraints {
-  // Upper limit on pixel dimensions/area, enforced by VerifyDimensions
-  // (called from decoders). Fuzzers set smaller values to limit memory use.
-  uint32_t dec_max_xsize = 0xFFFFFFFFu;
-  uint32_t dec_max_ysize = 0xFFFFFFFFu;
-  uint64_t dec_max_pixels = 0xFFFFFFFFu;  // Might be up to ~0ull
-};
-
-template <typename T,
-          class = typename std::enable_if<std::is_unsigned<T>::value>::type>
-Status VerifyDimensions(const SizeConstraints* constraints, T xs, T ys) {
-  if (!constraints) return true;
-
-  if (xs == 0 || ys == 0) return JXL_FAILURE("Empty image.");
-  if (xs > constraints->dec_max_xsize) return JXL_FAILURE("Image too wide.");
-  if (ys > constraints->dec_max_ysize) return JXL_FAILURE("Image too tall.");
-
-  const uint64_t num_pixels = static_cast<uint64_t>(xs) * ys;
-  if (num_pixels > constraints->dec_max_pixels) {
-    return JXL_FAILURE("Image too big.");
-  }
-
-  return true;
-}
-
-using CodecIntervals = std::array<CodecInterval, 4>;  // RGB[A] or Y[A]
-
 // Optional text/EXIF metadata.
 struct Blobs {
-  PaddedBytes exif;
-  PaddedBytes iptc;
-  PaddedBytes jumbf;
-  PaddedBytes xmp;
+  std::vector<uint8_t> exif;
+  std::vector<uint8_t> iptc;
+  std::vector<uint8_t> jhgm;
+  std::vector<uint8_t> jumbf;
+  std::vector<uint8_t> xmp;
 };
 
 // Holds a preview, a main image or one or more frames, plus the inputs/outputs
 // to/from decoding/encoding.
 class CodecInOut {
  public:
-  CodecInOut() : preview_frame(&metadata.m) {
+  explicit CodecInOut(JxlMemoryManager* memory_manager)
+      : memory_manager(memory_manager),
+        preview_frame(memory_manager, &metadata.m) {
     frames.reserve(1);
-    frames.emplace_back(&metadata.m);
+    frames.emplace_back(memory_manager, &metadata.m);
   }
 
   // Move-only.
@@ -83,7 +49,7 @@ class CodecInOut {
   CodecInOut& operator=(CodecInOut&&) = default;
 
   size_t LastStillFrame() const {
-    JXL_DASSERT(frames.size() > 0);
+    JXL_DASSERT(!frames.empty());
     size_t last = 0;
     for (size_t i = 0; i < frames.size(); i++) {
       last = i;
@@ -96,77 +62,50 @@ class CodecInOut {
   const ImageBundle& Main() const { return frames[LastStillFrame()]; }
 
   // If c_current.IsGray(), all planes must be identical.
-  void SetFromImage(Image3F&& color, const ColorEncoding& c_current) {
-    Main().SetFromImage(std::move(color), c_current);
-    SetIntensityTarget(this);
-    SetSize(Main().xsize(), Main().ysize());
+  Status SetFromImage(Image3F&& color, const ColorEncoding& c_current) {
+    JXL_RETURN_IF_ERROR(Main().SetFromImage(std::move(color), c_current));
+    SetIntensityTarget(&this->metadata.m);
+    JXL_RETURN_IF_ERROR(SetSize(Main().xsize(), Main().ysize()));
+    return true;
   }
 
-  void SetSize(size_t xsize, size_t ysize) {
-    JXL_CHECK(metadata.size.Set(xsize, ysize));
+  Status SetSize(size_t xsize, size_t ysize) {
+    JXL_RETURN_IF_ERROR(metadata.size.Set(xsize, ysize));
+    return true;
   }
 
-  void CheckMetadata() const {
-    JXL_CHECK(metadata.m.bit_depth.bits_per_sample != 0);
-    JXL_CHECK(!metadata.m.color_encoding.ICC().empty());
+  Status CheckMetadata() const {
+    JXL_ENSURE(metadata.m.bit_depth.bits_per_sample != 0);
+    JXL_ENSURE(!metadata.m.color_encoding.ICC().empty());
 
-    if (preview_frame.xsize() != 0) preview_frame.VerifyMetadata();
-    JXL_CHECK(preview_frame.metadata() == &metadata.m);
+    if (preview_frame.xsize() != 0) {
+      JXL_RETURN_IF_ERROR(preview_frame.VerifyMetadata());
+    }
+    JXL_ENSURE(preview_frame.metadata() == &metadata.m);
 
     for (const ImageBundle& ib : frames) {
-      ib.VerifyMetadata();
-      JXL_CHECK(ib.metadata() == &metadata.m);
+      JXL_RETURN_IF_ERROR(ib.VerifyMetadata());
+      JXL_ENSURE(ib.metadata() == &metadata.m);
     }
+    return true;
   }
 
   size_t xsize() const { return metadata.size.xsize(); }
   size_t ysize() const { return metadata.size.ysize(); }
-  void ShrinkTo(size_t xsize, size_t ysize) {
+  Status ShrinkTo(size_t xsize, size_t ysize) {
     // preview is unaffected.
     for (ImageBundle& ib : frames) {
-      ib.ShrinkTo(xsize, ysize);
+      JXL_RETURN_IF_ERROR(ib.ShrinkTo(xsize, ysize));
     }
-    SetSize(xsize, ysize);
-  }
-
-  // Calls TransformTo for each ImageBundle (preview/frames).
-  Status TransformTo(const ColorEncoding& c_desired, const JxlCmsInterface& cms,
-                     ThreadPool* pool = nullptr) {
-    if (metadata.m.have_preview) {
-      JXL_RETURN_IF_ERROR(preview_frame.TransformTo(c_desired, cms, pool));
-    }
-    for (ImageBundle& ib : frames) {
-      JXL_RETURN_IF_ERROR(ib.TransformTo(c_desired, cms, pool));
-    }
+    JXL_RETURN_IF_ERROR(SetSize(xsize, ysize));
     return true;
   }
-  // Calls PremultiplyAlpha for each ImageBundle (preview/frames).
-  void PremultiplyAlpha() {
-    ExtraChannelInfo* eci = metadata.m.Find(ExtraChannel::kAlpha);
-    if (eci == nullptr || eci->alpha_associated) return;  // nothing to do
-    if (metadata.m.have_preview) {
-      preview_frame.PremultiplyAlpha();
-    }
-    for (ImageBundle& ib : frames) {
-      ib.PremultiplyAlpha();
-    }
-    eci->alpha_associated = true;
-    return;
-  }
-
-  // -- DECODER INPUT:
-
-  SizeConstraints constraints;
-
-  // -- DECODER OUTPUT:
-
-  // Total number of pixels decoded (may differ from #frames * xsize * ysize
-  // if frames are cropped)
-  uint64_t dec_pixels = 0;
 
   // -- DECODER OUTPUT, ENCODER INPUT:
 
   // Metadata stored into / retrieved from bitstreams.
+
+  JxlMemoryManager* memory_manager;
 
   Blobs blobs;
 
@@ -177,7 +116,6 @@ class CodecInOut {
 
   std::vector<ImageBundle> frames;  // size=1 if !metadata.have_animation
 
-  bool use_sjpeg = false;
   // If the image should be written to a JPEG, use this quality for encoding.
   size_t jpeg_quality;
 };
