@@ -8,7 +8,14 @@
 # runner. This test that the tooling to generate the conformance test and the
 # conformance test runner work together.
 
-MYDIR=$(dirname $(realpath "$0"))
+SELF=$(realpath "$0")
+MYDIR=$(dirname "${SELF}")
+
+if [[ $# -eq 2 ]]; then
+    JPEGXL_TEST_DATA_PATH="$2"
+else
+    JPEGXL_TEST_DATA_PATH="${MYDIR}/../../testdata"
+fi
 
 set -eux
 
@@ -35,13 +42,13 @@ main() {
     build_dir=$(realpath "${MYDIR}/../../build")
   fi
 
-  local decoder="${build_dir}/tools/conformance/djxl_conformance"
+  local decoder="${build_dir}/tools/djxl"
   "${MYDIR}/generator.py" \
     --decoder="${decoder}" \
     --output="${tmpdir}" \
     --peak_error=0.001 \
     --rmse=0.001 \
-    "${MYDIR}/../../third_party/testdata/jxl/blending/cropped_traffic_light.jxl"
+    "${JPEGXL_TEST_DATA_PATH}/jxl/blending/cropped_traffic_light.jxl"
 
   # List the contents of the corpus dir.
   tree "${tmpdir}" || true

@@ -5,7 +5,10 @@
 
 #include "lib/jxl/base/bits.h"
 
-#include "gtest/gtest.h"
+#include <cstddef>
+#include <cstdint>
+
+#include "lib/jxl/testing.h"
 
 namespace jxl {
 namespace {
@@ -38,8 +41,13 @@ TEST(BitsTest, TestFloorLog2) {
   const size_t expected[7] = {0, 1, 1, 2, 2, 2, 2};
   for (uint32_t i = 1; i <= 7; ++i) {
     EXPECT_EQ(expected[i - 1], FloorLog2Nonzero(i)) << " " << i;
-    EXPECT_EQ(expected[i - 1], FloorLog2Nonzero(uint64_t(i))) << " " << i;
+    EXPECT_EQ(expected[i - 1], FloorLog2Nonzero(static_cast<uint64_t>(i)))
+        << " " << i;
   }
+
+  EXPECT_EQ(11u, FloorLog2Nonzero(0x00000fffu));  // 4095
+  EXPECT_EQ(12u, FloorLog2Nonzero(0x00001000u));  // 4096
+  EXPECT_EQ(12u, FloorLog2Nonzero(0x00001001u));  // 4097
 
   EXPECT_EQ(31u, FloorLog2Nonzero(0x80000000u));
   EXPECT_EQ(31u, FloorLog2Nonzero(0x80000001u));
@@ -59,8 +67,13 @@ TEST(BitsTest, TestCeilLog2) {
   const size_t expected[7] = {0, 1, 2, 2, 3, 3, 3};
   for (uint32_t i = 1; i <= 7; ++i) {
     EXPECT_EQ(expected[i - 1], CeilLog2Nonzero(i)) << " " << i;
-    EXPECT_EQ(expected[i - 1], CeilLog2Nonzero(uint64_t(i))) << " " << i;
+    EXPECT_EQ(expected[i - 1], CeilLog2Nonzero(static_cast<uint64_t>(i)))
+        << " " << i;
   }
+
+  EXPECT_EQ(12u, CeilLog2Nonzero(0x00000fffu));  // 4095
+  EXPECT_EQ(12u, CeilLog2Nonzero(0x00001000u));  // 4096
+  EXPECT_EQ(13u, CeilLog2Nonzero(0x00001001u));  // 4097
 
   EXPECT_EQ(31u, CeilLog2Nonzero(0x80000000u));
   EXPECT_EQ(32u, CeilLog2Nonzero(0x80000001u));

@@ -10,17 +10,20 @@
 // of the decoder state needed to parse the JPEG reconstruction box and provide
 // the reconstructed JPEG to the output buffer.
 
+#include <jxl/decode.h>
 #include <stdint.h>
 #include <stdlib.h>
 
+#include <algorithm>
+#include <cstring>
 #include <memory>
+#include <utility>
 #include <vector>
 
-#include "jxl/decode.h"
 #include "lib/jxl/base/status.h"
 #include "lib/jxl/common.h"  // JPEGXL_ENABLE_TRANSCODE_JPEG
 #include "lib/jxl/image_bundle.h"
-#include "lib/jxl/jpeg/dec_jpeg_data.h"
+#include "lib/jxl/jpeg/jpeg_data.h"
 #if JPEGXL_ENABLE_TRANSCODE_JPEG
 #include "lib/jxl/jpeg/dec_jpeg_data_writer.h"
 #endif  // JPEGXL_ENABLE_TRANSCODE_JPEG
@@ -109,7 +112,7 @@ class JxlToJpegDecoder {
                                     jpeg_data_.get())) {
         return false;
       }
-      ib->jpeg_data.reset(jpeg_data_.release());
+      ib->jpeg_data = std::move(jpeg_data_);
     }
     return true;
   }
@@ -121,7 +124,7 @@ class JxlToJpegDecoder {
     auto write = [&tmp_next_out, &tmp_avail_size](const uint8_t* buf,
                                                   size_t len) {
       size_t to_write = std::min<size_t>(tmp_avail_size, len);
-      memcpy(tmp_next_out, buf, to_write);
+      if (to_write != 0) memcpy(tmp_next_out, buf, to_write);
       tmp_next_out += to_write;
       tmp_avail_size -= to_write;
       return to_write;

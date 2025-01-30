@@ -5,10 +5,18 @@
 
 #include "lib/extras/dec/pgx.h"
 
-#include <string.h>
+#include <jxl/codestream_header.h>
+#include <jxl/types.h>
 
-#include "lib/jxl/base/bits.h"
-#include "lib/jxl/base/compiler_specific.h"
+#include <cstdint>
+#include <cstring>
+#include <utility>
+
+#include "lib/extras/dec/color_hints.h"
+#include "lib/extras/packed_image.h"
+#include "lib/extras/size_constraints.h"
+#include "lib/jxl/base/span.h"
+#include "lib/jxl/base/status.h"
 
 namespace jxl {
 namespace extras {
@@ -117,6 +125,8 @@ class Parser {
     // 0xa, or 0xd 0xa.
     JXL_RETURN_IF_ERROR(SkipLineBreak());
 
+    // TODO(jon): could do up to 24-bit by converting the values to
+    // JXL_TYPE_FLOAT.
     if (header->bits_per_sample > 16) {
       return JXL_FAILURE("PGX: >16 bits not yet supported");
     }
@@ -127,9 +137,7 @@ class Parser {
     }
 
     size_t numpixels = header->xsize * header->ysize;
-    size_t bytes_per_pixel = header->bits_per_sample <= 8
-                                 ? 1
-                                 : header->bits_per_sample <= 16 ? 2 : 4;
+    size_t bytes_per_pixel = header->bits_per_sample <= 8 ? 1 : 2;
     if (pos_ + numpixels * bytes_per_pixel > end_) {
       return JXL_FAILURE("PGX: data too small");
     }
@@ -145,15 +153,14 @@ class Parser {
 }  // namespace
 
 Status DecodeImagePGX(const Span<const uint8_t> bytes,
-                      const ColorHints& color_hints,
-                      const SizeConstraints& constraints,
-                      PackedPixelFile* ppf) {
+                      const ColorHints& color_hints, PackedPixelFile* ppf,
+                      const SizeConstraints* constraints) {
   Parser parser(bytes);
   HeaderPGX header = {};
-  const uint8_t* pos;
+  const uint8_t* pos = nullptr;
   if (!parser.ParseHeader(&header, &pos)) return false;
   JXL_RETURN_IF_ERROR(
-      VerifyDimensions(&constraints, header.xsize, header.ysize));
+      VerifyDimensions(constraints, header.xsize, header.ysize));
   if (header.bits_per_sample == 0 || header.bits_per_sample > 32) {
     return JXL_FAILURE("PGX: bits_per_sample invalid");
   }
@@ -165,7 +172,7 @@ Status DecodeImagePGX(const Span<const uint8_t> bytes,
   // Original data is uint, so exponent_bits_per_sample = 0.
   ppf->info.bits_per_sample = header.bits_per_sample;
   ppf->info.exponent_bits_per_sample = 0;
-  ppf->info.uses_original_profile = true;
+  ppf->info.uses_original_profile = JXL_TRUE;
 
   // No alpha in PGX
   ppf->info.alpha_bits = 0;
@@ -174,9 +181,7 @@ Status DecodeImagePGX(const Span<const uint8_t> bytes,
   ppf->info.orientation = JXL_ORIENT_IDENTITY;
 
   JxlDataType data_type;
-  if (header.bits_per_sample > 16) {
-    data_type = JXL_TYPE_UINT32;
-  } else if (header.bits_per_sample > 8) {
+  if (header.bits_per_sample > 8) {
     data_type = JXL_TYPE_UINT16;
   } else {
     data_type = JXL_TYPE_UINT8;
@@ -190,7 +195,12 @@ Status DecodeImagePGX(const Span<const uint8_t> bytes,
   };
   ppf->frames.clear();
   // Allocates the frame buffer.
-  ppf->frames.emplace_back(header.xsize, header.ysize, format);
+  {
+    JXL_ASSIGN_OR_RETURN(
+        PackedFrame frame,
+        PackedFrame::Create(header.xsize, header.ysize, format));
+    ppf->frames.emplace_back(std::move(frame));
+  }
   const auto& frame = ppf->frames.back();
   size_t pgx_remaining_size = bytes.data() + bytes.size() - pos;
   if (pgx_remaining_size < frame.color.pixels_size) {

@@ -5,9 +5,11 @@
 
 #include "tools/codec_config.h"
 
+#include <cstdint>
+#include <cstdio>
 #include <hwy/targets.h>
+#include <string>
 
-#include "lib/jxl/base/status.h"
 #include "tools/tool_version.h"
 
 namespace jpegxl {
@@ -45,8 +47,9 @@ std::string CodecConfigString(uint32_t lib_version) {
     config += ',';
     saw_target = true;
   }
-  JXL_ASSERT(saw_target);
-  (void)saw_target;
+  if (!saw_target) {
+    config += "no targets found,";
+  }
   config.resize(config.size() - 1);  // remove trailing comma
   config += "]";
 

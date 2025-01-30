@@ -6,9 +6,19 @@
 #ifndef LIB_JXL_RENDER_PIPELINE_RENDER_PIPELINE_H_
 #define LIB_JXL_RENDER_PIPELINE_RENDER_PIPELINE_H_
 
-#include <stdint.h>
+#include <jxl/memory_manager.h>
 
-#include "lib/jxl/filters.h"
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <utility>
+#include <vector>
+
+#include "lib/jxl/base/rect.h"
+#include "lib/jxl/base/status.h"
+#include "lib/jxl/frame_dimensions.h"
+#include "lib/jxl/image.h"
 #include "lib/jxl/render_pipeline/render_pipeline_stage.h"
 
 namespace jxl {
@@ -32,10 +42,10 @@ class RenderPipelineInput {
   }
 
   RenderPipelineInput() = default;
-  void Done();
+  Status Done();
 
   const std::pair<ImageF*, Rect>& GetBuffer(size_t c) const {
-    JXL_ASSERT(c < buffers_.size());
+    JXL_DASSERT(c < buffers_.size());
     return buffers_[c];
   }
 
@@ -51,38 +61,47 @@ class RenderPipeline {
  public:
   class Builder {
    public:
-    explicit Builder(size_t num_c) : num_c_(num_c) { JXL_ASSERT(num_c > 0); }
+    explicit Builder(JxlMemoryManager* memory_manager, size_t num_c)
+        : memory_manager_(memory_manager), num_c_(num_c) {
+      JXL_DASSERT(num_c > 0);
+    }
 
     // Adds a stage to the pipeline. Must be called at least once; the last
     // added stage cannot have kInOut channels.
-    void AddStage(std::unique_ptr<RenderPipelineStage> stage);
+    Status AddStage(std::unique_ptr<RenderPipelineStage> stage);
 
     // Enables using the simple (i.e. non-memory-efficient) implementation of
     // the pipeline.
     void UseSimpleImplementation() { use_simple_implementation_ = true; }
 
-    // Marks the 3 last channels as being noise input channels, which use the
-    // same size as color channels.
-    void UsesNoise() { uses_noise_ = true; }
-
     // Finalizes setup of the pipeline. Shifts for all channels should be 0 at
     // this point.
-    std::unique_ptr<RenderPipeline> Finalize(
+    StatusOr<std::unique_ptr<RenderPipeline>> Finalize(
         FrameDimensions frame_dimensions) &&;
 
    private:
+    JxlMemoryManager* memory_manager_;
     std::vector<std::unique_ptr<RenderPipelineStage>> stages_;
     size_t num_c_;
     bool use_simple_implementation_ = false;
-    bool uses_noise_ = false;
   };
 
   friend class Builder;
 
   virtual ~RenderPipeline() = default;
 
-  // Allocates storage to run with `num` threads.
-  void PrepareForThreads(size_t num);
+  Status IsInitialized() const {
+    for (const auto& stage : stages_) {
+      JXL_RETURN_IF_ERROR(stage->IsInitialized());
+    }
+    return true;
+  }
+
+  // Allocates storage to run with `num` threads. If `use_group_ids` is true,
+  // storage is allocated for each group, not each thread. The behaviour is
+  // undefined if calling this function multiple times with a different value
+  // for `use_group_ids`.
+  Status PrepareForThreads(size_t num, bool use_group_ids);
 
   // Retrieves a buffer where input data should be stored by the callee. When
   // input has been provided for all buffers, the pipeline will complete its
@@ -95,34 +114,42 @@ class RenderPipeline {
                              group_completed_passes_.end());
   }
 
+  virtual void ClearDone(size_t i) {}
+
  protected:
+  explicit RenderPipeline(JxlMemoryManager* memory_manager)
+      : memory_manager_(memory_manager) {}
+  JxlMemoryManager* memory_manager_;
+
   std::vector<std::unique_ptr<RenderPipelineStage>> stages_;
   // Shifts for every channel at the input of each stage.
   std::vector<std::vector<std::pair<size_t, size_t>>> channel_shifts_;
-  // Amount of (cumulative) padding required by each stage.
-  std::vector<size_t> padding_;
+
+  // Amount of (cumulative) padding required by each stage and channel, in
+  // either direction.
+  std::vector<std::vector<std::pair<size_t, size_t>>> padding_;
+
   FrameDimensions frame_dimensions_;
-  bool uses_noise_;
 
   std::vector<uint8_t> group_completed_passes_;
-
-  // Indexed by thread_id
-  std::vector<CacheAlignedUniquePtr> temp_buffers_;
 
   friend class RenderPipelineInput;
 
  private:
-  void InputReady(size_t group_id, size_t thread_id,
-                  const std::vector<std::pair<ImageF*, Rect>>& buffers);
+  Status InputReady(size_t group_id, size_t thread_id,
+                    const std::vector<std::pair<ImageF*, Rect>>& buffers);
 
   virtual std::vector<std::pair<ImageF*, Rect>> PrepareBuffers(
       size_t group_id, size_t thread_id) = 0;
 
-  virtual void ProcessBuffers(size_t group_id, size_t thread_id) = 0;
+  virtual Status ProcessBuffers(size_t group_id, size_t thread_id) = 0;
 
   // Note that this method may be called multiple times with different (or
   // equal) `num`.
-  virtual void PrepareForThreadsInternal(size_t num) = 0;
+  virtual Status PrepareForThreadsInternal(size_t num, bool use_group_ids) = 0;
+
+  // Called once frame dimensions and stages are known.
+  virtual Status Init() { return true; }
 };
 
 }  // namespace jxl
