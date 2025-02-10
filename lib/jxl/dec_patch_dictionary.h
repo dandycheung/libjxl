@@ -8,20 +8,29 @@
 
 // Chooses reference patches, and avoids encoding them once per occurrence.
 
-#include <stddef.h>
-#include <string.h>
-#include <sys/types.h>
+#include <jxl/memory_manager.h>
 
-#include <tuple>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <utility>
 #include <vector>
 
+#include "lib/jxl/base/compiler_specific.h"  // ssize_t
 #include "lib/jxl/base/status.h"
-#include "lib/jxl/common.h"
 #include "lib/jxl/dec_bit_reader.h"
-#include "lib/jxl/image.h"
-#include "lib/jxl/opsin_params.h"
+#include "lib/jxl/image_bundle.h"
+#include "lib/jxl/image_metadata.h"
 
 namespace jxl {
+
+struct ReferenceFrame {
+  std::unique_ptr<ImageBundle> frame;
+  // ImageBundle doesn't yet have a simple way to state it is in XYB.
+  bool ib_is_in_xyb = false;
+};
 
 enum class PatchBlendMode : uint8_t {
   // The new values are the old ones. Useful to skip some channels.
@@ -56,8 +65,10 @@ enum class PatchBlendMode : uint8_t {
   // For other channels: sample = old + alpha * new
   kAlphaWeightedAddAbove = 6,
   kAlphaWeightedAddBelow = 7,
-  kNumBlendModes,
 };
+
+constexpr uint8_t kNumPatchBlendModes =
+    static_cast<uint8_t>(PatchBlendMode::kAlphaWeightedAddBelow) + 1;
 
 inline bool UsesAlpha(PatchBlendMode mode) {
   return mode == PatchBlendMode::kBlendAbove ||
@@ -78,25 +89,12 @@ struct PatchBlending {
 // Position and size of the patch in the reference frame.
 struct PatchReferencePosition {
   size_t ref, x0, y0, xsize, ysize;
-  bool operator<(const PatchReferencePosition& oth) const {
-    return std::make_tuple(ref, x0, y0, xsize, ysize) <
-           std::make_tuple(oth.ref, oth.x0, oth.y0, oth.xsize, oth.ysize);
-  }
-  bool operator==(const PatchReferencePosition& oth) const {
-    return !(*this < oth) && !(oth < *this);
-  }
 };
 
 struct PatchPosition {
   // Position of top-left corner of the patch in the image.
   size_t x, y;
-  // Different blend mode for color and extra channels.
-  std::vector<PatchBlending> blending;
-  PatchReferencePosition ref_pos;
-  bool operator<(const PatchPosition& oth) const {
-    return std::make_tuple(ref_pos, x, y) <
-           std::make_tuple(oth.ref_pos, oth.x, oth.y);
-  }
+  size_t ref_pos_idx;
 };
 
 struct PassesSharedState;
@@ -106,54 +104,63 @@ class PatchDictionaryEncoder;
 
 class PatchDictionary {
  public:
-  PatchDictionary() = default;
+  explicit PatchDictionary(JxlMemoryManager* memory_manager)
+      : memory_manager_(memory_manager) {}
 
-  void SetPassesSharedState(const PassesSharedState* shared) {
-    shared_ = shared;
+  void SetShared(const std::array<ReferenceFrame, 4>* reference_frames) {
+    reference_frames_ = reference_frames;
   }
 
   bool HasAny() const { return !positions_.empty(); }
 
-  Status Decode(BitReader* br, size_t xsize, size_t ysize,
+  Status Decode(JxlMemoryManager* memory_manager, BitReader* br, size_t xsize,
+                size_t ysize, size_t num_extra_channels,
                 bool* uses_extra_channels);
 
   void Clear() {
     positions_.clear();
-    ComputePatchCache();
+    ComputePatchTree();
   }
 
   // Adds patches to a segment of `xsize` pixels, starting at `inout`, assumed
   // to be located at position (x0, y) in the frame.
-  void AddOneRow(float* const* inout, size_t y, size_t x0, size_t xsize) const;
-
-  // Only adds patches that belong to the `image_rect` area of the decoded
-  // image, writing them to the `opsin_rect` area of `opsin`.
-  void AddTo(Image3F* opsin, const Rect& opsin_rect,
-             float* const* extra_channels, const Rect& image_rect) const;
+  Status AddOneRow(
+      float* const* inout, size_t y, size_t x0, size_t xsize,
+      const std::vector<ExtraChannelInfo>& extra_channel_info) const;
 
   // Returns dependencies of this patch dictionary on reference frame ids as a
   // bit mask: bits 0-3 indicate reference frame 0-3.
   int GetReferences() const;
 
+  std::vector<size_t> GetPatchesForRow(size_t y) const;
+
  private:
   friend class PatchDictionaryEncoder;
 
-  const PassesSharedState* shared_;
+  JxlMemoryManager* memory_manager_;
+  const std::array<ReferenceFrame, 4>* reference_frames_;
   std::vector<PatchPosition> positions_;
+  std::vector<PatchReferencePosition> ref_positions_;
+  std::vector<PatchBlending> blendings_;
+  size_t blendings_stride_;
 
-  // Patch occurrences sorted by y.
-  std::vector<size_t> sorted_patches_;
-  // Index of the first patch for each y value.
-  std::vector<size_t> patch_starts_;
+  // Interval tree on the y coordinates of the patches.
+  struct PatchTreeNode {
+    ssize_t left_child;
+    ssize_t right_child;
+    size_t y_center;
+    // Range of patches in sorted_patches_y0_ and sorted_patches_y1_ that
+    // contain the row y_center.
+    size_t start;
+    size_t num;
+  };
+  std::vector<PatchTreeNode> patch_tree_;
+  // Number of patches for each row.
+  std::vector<size_t> num_patches_;
+  std::vector<std::pair<size_t, size_t>> sorted_patches_y0_;
+  std::vector<std::pair<size_t, size_t>> sorted_patches_y1_;
 
-  // Patch IDs in position [patch_starts_[y], patch_start_[y+1]) of
-  // sorted_patches_ are all the patches that intersect the horizontal line at
-  // y.
-  // The relative order of patches that affect the same pixels is the same -
-  // important when applying patches is noncommutative.
-
-  // Compute patches_by_y_ after updating positions_.
-  void ComputePatchCache();
+  void ComputePatchTree();
 };
 
 }  // namespace jxl

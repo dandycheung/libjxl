@@ -5,6 +5,14 @@
 
 #include "lib/jxl/render_pipeline/stage_ycbcr.h"
 
+#include <cstddef>
+#include <memory>
+
+#include "lib/jxl/base/common.h"
+#include "lib/jxl/base/compiler_specific.h"
+#include "lib/jxl/base/status.h"
+#include "lib/jxl/render_pipeline/render_pipeline_stage.h"
+
 #undef HWY_TARGET_INCLUDE
 #define HWY_TARGET_INCLUDE "lib/jxl/render_pipeline/stage_ycbcr.cc"
 #include <hwy/foreach_target.h>
@@ -14,15 +22,17 @@ HWY_BEFORE_NAMESPACE();
 namespace jxl {
 namespace HWY_NAMESPACE {
 
+// These templates are not found via ADL.
+using hwy::HWY_NAMESPACE::Add;
+using hwy::HWY_NAMESPACE::MulAdd;
+
 class kYCbCrStage : public RenderPipelineStage {
  public:
   kYCbCrStage() : RenderPipelineStage(RenderPipelineStage::Settings()) {}
 
-  void ProcessRow(const RowInfo& input_rows, const RowInfo& output_rows,
-                  size_t xextra, size_t xsize, size_t xpos, size_t ypos,
-                  float* JXL_RESTRICT temp) const final {
-    PROFILER_ZONE("UndoYCbCr");
-
+  Status ProcessRow(const RowInfo& input_rows, const RowInfo& output_rows,
+                    size_t xextra, size_t xsize, size_t xpos, size_t ypos,
+                    size_t thread_id) const final {
     const HWY_FULL(float) df;
 
     // Full-range BT.601 as defined by JFIF Clause 7:
@@ -36,23 +46,28 @@ class kYCbCrStage : public RenderPipelineStage {
     float* JXL_RESTRICT row0 = GetInputRow(input_rows, 0, 0);
     float* JXL_RESTRICT row1 = GetInputRow(input_rows, 1, 0);
     float* JXL_RESTRICT row2 = GetInputRow(input_rows, 2, 0);
+    // TODO(eustas): when using frame origin, addresses might be unaligned;
+    //               making them aligned will void performance penalty.
     for (size_t x = 0; x < xsize; x += Lanes(df)) {
-      const auto y_vec = Load(df, row1 + x) + c128;
-      const auto cb_vec = Load(df, row0 + x);
-      const auto cr_vec = Load(df, row2 + x);
-      const auto r_vec = crcr * cr_vec + y_vec;
-      const auto g_vec = cgcr * cr_vec + cgcb * cb_vec + y_vec;
-      const auto b_vec = cbcb * cb_vec + y_vec;
-      Store(r_vec, df, row0 + x);
-      Store(g_vec, df, row1 + x);
-      Store(b_vec, df, row2 + x);
+      const auto y_vec = Add(LoadU(df, row1 + x), c128);
+      const auto cb_vec = LoadU(df, row0 + x);
+      const auto cr_vec = LoadU(df, row2 + x);
+      const auto r_vec = MulAdd(crcr, cr_vec, y_vec);
+      const auto g_vec = MulAdd(cgcr, cr_vec, MulAdd(cgcb, cb_vec, y_vec));
+      const auto b_vec = MulAdd(cbcb, cb_vec, y_vec);
+      StoreU(r_vec, df, row0 + x);
+      StoreU(g_vec, df, row1 + x);
+      StoreU(b_vec, df, row2 + x);
     }
+    return true;
   }
 
   RenderPipelineChannelMode GetChannelMode(size_t c) const final {
     return c < 3 ? RenderPipelineChannelMode::kInPlace
                  : RenderPipelineChannelMode::kIgnored;
   }
+
+  const char* GetName() const override { return "YCbCr"; }
 };
 
 std::unique_ptr<RenderPipelineStage> GetYCbCrStage() {
