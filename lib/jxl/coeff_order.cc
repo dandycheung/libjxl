@@ -5,36 +5,27 @@
 
 #include "lib/jxl/coeff_order.h"
 
-#include <stdint.h>
+#include <jxl/memory_manager.h>
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <vector>
 
-#include "lib/jxl/ans_params.h"
-#include "lib/jxl/aux_out.h"
-#include "lib/jxl/aux_out_fwd.h"
-#include "lib/jxl/base/padded_bytes.h"
-#include "lib/jxl/base/profiler.h"
-#include "lib/jxl/base/span.h"
+#include "lib/jxl/ac_strategy.h"
+#include "lib/jxl/base/status.h"
 #include "lib/jxl/coeff_order_fwd.h"
 #include "lib/jxl/dec_ans.h"
 #include "lib/jxl/dec_bit_reader.h"
-#include "lib/jxl/entropy_coder.h"
+#include "lib/jxl/frame_dimensions.h"
 #include "lib/jxl/lehmer_code.h"
 #include "lib/jxl/modular/encoding/encoding.h"
-#include "lib/jxl/modular/modular_image.h"
 
 namespace jxl {
 
-void SetDefaultOrder(AcStrategy acs, coeff_order_t* JXL_RESTRICT order) {
-  PROFILER_FUNC;
-  const size_t size =
-      kDCTBlockSize * acs.covered_blocks_x() * acs.covered_blocks_y();
-  const coeff_order_t* natural_coeff_order = acs.NaturalCoeffOrder();
-  for (size_t k = 0; k < size; ++k) {
-    order[k] = natural_coeff_order[k];
-  }
-}
+static_assert(AcStrategy::kNumValidStrategies == kStrategyOrder.size(),
+              "Update this array when adding or removing AC strategies.");
 
 uint32_t CoeffOrderContext(uint32_t val) {
   uint32_t token, nbits, bits;
@@ -60,24 +51,26 @@ Status ReadPermutation(size_t skip, size_t size, coeff_order_t* order,
     lehmer[i] =
         reader->ReadHybridUint(CoeffOrderContext(last), br, context_map);
     last = lehmer[i];
-    if (lehmer[i] + i >= size) {
+    if (lehmer[i] >= size - i) {
       return JXL_FAILURE("Invalid lehmer code");
     }
   }
   if (order == nullptr) return true;
-  DecodeLehmerCode(lehmer.data(), temp.data(), size, order);
+  JXL_RETURN_IF_ERROR(
+      DecodeLehmerCode(lehmer.data(), temp.data(), size, order));
   return true;
 }
 
 }  // namespace
 
-Status DecodePermutation(size_t skip, size_t size, coeff_order_t* order,
-                         BitReader* br) {
+Status DecodePermutation(JxlMemoryManager* memory_manager, size_t skip,
+                         size_t size, coeff_order_t* order, BitReader* br) {
   std::vector<uint8_t> context_map;
   ANSCode code;
-  JXL_RETURN_IF_ERROR(
-      DecodeHistograms(br, kPermutationContexts, &code, &context_map));
-  ANSSymbolReader reader(&code, br);
+  JXL_RETURN_IF_ERROR(DecodeHistograms(memory_manager, br, kPermutationContexts,
+                                       &code, &context_map));
+  JXL_ASSIGN_OR_RETURN(ANSSymbolReader reader,
+                       ANSSymbolReader::Create(&code, br));
   JXL_RETURN_IF_ERROR(
       ReadPermutation(skip, size, order, br, &reader, context_map));
   if (!reader.CheckANSFinalState()) {
@@ -90,34 +83,35 @@ namespace {
 
 Status DecodeCoeffOrder(AcStrategy acs, coeff_order_t* order, BitReader* br,
                         ANSSymbolReader* reader,
+                        std::vector<coeff_order_t>& natural_order,
                         const std::vector<uint8_t>& context_map) {
-  PROFILER_FUNC;
   const size_t llf = acs.covered_blocks_x() * acs.covered_blocks_y();
   const size_t size = kDCTBlockSize * llf;
 
   JXL_RETURN_IF_ERROR(
       ReadPermutation(llf, size, order, br, reader, context_map));
   if (order == nullptr) return true;
-  const coeff_order_t* natural_coeff_order = acs.NaturalCoeffOrder();
   for (size_t k = 0; k < size; ++k) {
-    order[k] = natural_coeff_order[order[k]];
+    order[k] = natural_order[order[k]];
   }
   return true;
 }
 
 }  // namespace
 
-Status DecodeCoeffOrders(uint16_t used_orders, uint32_t used_acs,
-                         coeff_order_t* order, BitReader* br) {
+Status DecodeCoeffOrders(JxlMemoryManager* memory_manager, uint16_t used_orders,
+                         uint32_t used_acs, coeff_order_t* order,
+                         BitReader* br) {
   uint16_t computed = 0;
   std::vector<uint8_t> context_map;
   ANSCode code;
-  std::unique_ptr<ANSSymbolReader> reader;
+  ANSSymbolReader reader;
+  std::vector<coeff_order_t> natural_order;
   // Bitstream does not have histograms if no coefficient order is used.
   if (used_orders != 0) {
-    JXL_RETURN_IF_ERROR(
-        DecodeHistograms(br, kPermutationContexts, &code, &context_map));
-    reader = make_unique<ANSSymbolReader>(&code, br);
+    JXL_RETURN_IF_ERROR(DecodeHistograms(
+        memory_manager, br, kPermutationContexts, &code, &context_map));
+    JXL_ASSIGN_OR_RETURN(reader, ANSSymbolReader::Create(&code, br));
   }
   uint32_t acs_mask = 0;
   for (uint8_t o = 0; o < AcStrategy::kNumValidStrategies; ++o) {
@@ -130,22 +124,32 @@ Status DecodeCoeffOrders(uint16_t used_orders, uint32_t used_acs,
     computed |= 1 << ord;
     AcStrategy acs = AcStrategy::FromRawStrategy(o);
     bool used = (acs_mask & (1 << ord)) != 0;
+
+    const size_t llf = acs.covered_blocks_x() * acs.covered_blocks_y();
+    const size_t size = kDCTBlockSize * llf;
+
+    if (used || (used_orders & (1 << ord))) {
+      if (natural_order.size() < size) natural_order.resize(size);
+      acs.ComputeNaturalCoeffOrder(natural_order.data());
+    }
+
     if ((used_orders & (1 << ord)) == 0) {
       // No need to set the default order if no ACS uses this order.
       if (used) {
         for (size_t c = 0; c < 3; c++) {
-          SetDefaultOrder(acs, &order[CoeffOrderOffset(ord, c)]);
+          memcpy(&order[CoeffOrderOffset(ord, c)], natural_order.data(),
+                 size * sizeof(*order));
         }
       }
     } else {
       for (size_t c = 0; c < 3; c++) {
         coeff_order_t* dest = used ? &order[CoeffOrderOffset(ord, c)] : nullptr;
-        JXL_RETURN_IF_ERROR(
-            DecodeCoeffOrder(acs, dest, br, reader.get(), context_map));
+        JXL_RETURN_IF_ERROR(DecodeCoeffOrder(acs, dest, br, &reader,
+                                             natural_order, context_map));
       }
     }
   }
-  if (used_orders && !reader->CheckANSFinalState()) {
+  if (used_orders && !reader.CheckANSFinalState()) {
     return JXL_FAILURE("Invalid ANS stream");
   }
   return true;

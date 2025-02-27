@@ -6,21 +6,21 @@
 #ifndef TOOLS_CMDLINE_H_
 #define TOOLS_CMDLINE_H_
 
-#include <stdio.h>
-#include <string.h>
-
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
-
-#include "lib/jxl/base/status.h"
 
 namespace jpegxl {
 namespace tools {
 
 class CommandLineParser {
  public:
-  typedef size_t OptionId;
+  typedef int OptionId;
 
   // An abstract class for defining command line options.
   class CmdOptionInterface {
@@ -54,7 +54,15 @@ class CommandLineParser {
     // Returns whether the option should be displayed as required in the help
     // output. No effect on validation.
     virtual bool required() const = 0;
+
+    // Returns whether the option is not really an option but just help text
+    virtual bool help_only() const = 0;
   };
+
+  // Add help text
+  void AddHelpText(const char* help_text, int verbosity_level = 0) {
+    options_.emplace_back(new CmdHelpText(help_text, verbosity_level));
+  }
 
   // Add a positional argument. Returns the id of the added option or
   // kOptionError on error.
@@ -62,8 +70,8 @@ class CommandLineParser {
   // optional, but is only used for how it is displayed in the command line
   // help.
   OptionId AddPositionalOption(const char* name, bool required,
-                               const char* help_text, const char** storage,
-                               int verbosity_level = 0) {
+                               const std::string& help_text,
+                               const char** storage, int verbosity_level = 0) {
     options_.emplace_back(new CmdOptionPositional(name, help_text, storage,
                                                   verbosity_level, required));
     return options_.size() - 1;
@@ -97,7 +105,6 @@ class CommandLineParser {
   }
 
   const CmdOptionInterface* GetOption(OptionId id) const {
-    JXL_ASSERT(id < options_.size());
     return options_[id].get();
   }
 
@@ -115,21 +122,54 @@ class CommandLineParser {
   // Return the remaining positional args
   std::vector<const char*> PositionalArgs() const;
 
+  // Conditionally print a message to stderr
+  void VerbosePrintf(int min_verbosity, const char* format, ...) const;
+
  private:
+  // Help text only.
+  class CmdHelpText : public CmdOptionInterface {
+   public:
+    CmdHelpText(const char* help_text, int verbosity_level)
+        : help_text_(help_text), verbosity_level_(verbosity_level) {}
+
+    std::string help_flags() const override { return ""; }
+    const char* help_text() const override { return help_text_; }
+    int verbosity_level() const override { return verbosity_level_; }
+    bool matched() const override { return false; }
+
+    bool Match(const char* arg, bool parse_options) const override {
+      return false;
+    }
+
+    bool Parse(const int argc, const char* argv[], int* i) override {
+      return true;
+    }
+
+    bool positional() const override { return false; }
+
+    bool required() const override { return false; }
+
+    bool help_only() const override { return true; }
+
+   private:
+    const char* help_text_;
+    const int verbosity_level_;
+  };
+
   // A positional argument.
   class CmdOptionPositional : public CmdOptionInterface {
    public:
-    CmdOptionPositional(const char* name, const char* help_text,
+    CmdOptionPositional(const char* name, std::string help_text,
                         const char** storage, int verbosity_level,
                         bool required)
         : name_(name),
-          help_text_(help_text),
+          help_text_(std::move(help_text)),
           storage_(storage),
           verbosity_level_(verbosity_level),
           required_(required) {}
 
     std::string help_flags() const override { return name_; }
-    const char* help_text() const override { return help_text_; }
+    const char* help_text() const override { return help_text_.c_str(); }
     int verbosity_level() const override { return verbosity_level_; }
     bool matched() const override { return matched_; }
 
@@ -152,9 +192,11 @@ class CommandLineParser {
 
     bool required() const override { return required_; }
 
+    bool help_only() const override { return false; }
+
    private:
     const char* name_;
-    const char* help_text_;
+    const std::string help_text_;
     const char** storage_;
     const int verbosity_level_;
     const bool required_;
@@ -228,7 +270,7 @@ class CommandLineParser {
             return (*parser_.parser_with_arg_)(arg, storage_);
           } else {
             fprintf(stderr, "--%s didn't expect any argument passed to it.\n",
-                    argv[*i]);
+                    long_name_);
             return false;
           }
         }
@@ -237,7 +279,7 @@ class CommandLineParser {
       (*i)++;
       if (metavar_) {
         if (argc <= *i) {
-          fprintf(stderr, "--%s expected an argument but none passed.\n",
+          fprintf(stderr, "%s expected an argument but none passed.\n",
                   argv[*i - 1]);
           return false;
         }
@@ -253,6 +295,8 @@ class CommandLineParser {
       // Only used for help display of positional arguments.
       return false;
     }
+
+    bool help_only() const override { return false; }
 
    private:
     // Returns whether arg matches the short_name flag of this option.
@@ -316,7 +360,93 @@ class CommandLineParser {
   bool help_ = false;
 };
 
+//
+// Common parsers for AddOptionValue and AddOptionFlag
+//
+
+static inline bool ParseSigned(const char* arg, int* out) {
+  char* end;
+  *out = static_cast<int>(strtol(arg, &end, 0));
+  if (end[0] != '\0') {
+    fprintf(stderr, "Unable to interpret as signed integer: %s.\n", arg);
+    return false;
+  }
+  return true;
+}
+
+static inline bool ParseUnsigned(const char* arg, size_t* out) {
+  char* end;
+  *out = static_cast<size_t>(strtoull(arg, &end, 0));
+  if (end[0] != '\0') {
+    fprintf(stderr, "Unable to interpret as unsigned integer: %s.\n", arg);
+    return false;
+  }
+  return true;
+}
+
+static inline bool ParseInt64(const char* arg, int64_t* out) {
+  char* end;
+  *out = strtol(arg, &end, 0);
+  if (end[0] != '\0') {
+    fprintf(stderr, "Unable to interpret as signed integer: %s.\n", arg);
+    return false;
+  }
+  return true;
+}
+
+static inline bool ParseUint32(const char* arg, uint32_t* out) {
+  size_t value = 0;
+  bool ret = ParseUnsigned(arg, &value);
+  if (ret) *out = value;
+  return ret;
+}
+
+static inline bool ParseFloat(const char* arg, float* out) {
+  char* end;
+  *out = static_cast<float>(strtod(arg, &end));
+  if (end[0] != '\0') {
+    fprintf(stderr, "Unable to interpret as float: %s.\n", arg);
+    return false;
+  }
+  return true;
+}
+
+static inline bool ParseDouble(const char* arg, double* out) {
+  char* end;
+  *out = static_cast<double>(strtod(arg, &end));
+  if (end[0] != '\0') {
+    fprintf(stderr, "Unable to interpret as double: %s.\n", arg);
+    return false;
+  }
+  return true;
+}
+
+static inline bool ParseString(const char* arg, std::string* out) {
+  out->assign(arg);
+  return true;
+}
+
+static inline bool SetBooleanTrue(bool* out) {
+  *out = true;
+  return true;
+}
+
+static inline bool SetBooleanFalse(bool* out) {
+  *out = false;
+  return true;
+}
+
 }  // namespace tools
 }  // namespace jpegxl
+
+#define JPEGXL_TOOLS_ABORT(M)                      \
+  fprintf(stderr, "JPEGXL_TOOLS_ABORT: %s\n", #M); \
+  std::exit(EXIT_FAILURE);
+
+#define JPEGXL_TOOLS_CHECK(C)                        \
+  if (!(C)) {                                        \
+    fprintf(stderr, "JPEGXL_TOOLS_CHECK: %s\n", #C); \
+    std::exit(EXIT_FAILURE);                         \
+  }
 
 #endif  // TOOLS_CMDLINE_H_

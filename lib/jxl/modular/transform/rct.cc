@@ -5,7 +5,26 @@
 
 #include "lib/jxl/modular/transform/rct.h"
 
+#include <cstddef>
+#include <cstdint>
+#include <utility>
+
+#include "lib/jxl/base/data_parallel.h"
+#include "lib/jxl/base/status.h"
+#include "lib/jxl/modular/modular_image.h"
+#include "lib/jxl/modular/transform/transform.h"
+#undef HWY_TARGET_INCLUDE
+#define HWY_TARGET_INCLUDE "lib/jxl/modular/transform/rct.cc"
+#include <hwy/foreach_target.h>
+#include <hwy/highway.h>
+HWY_BEFORE_NAMESPACE();
 namespace jxl {
+namespace HWY_NAMESPACE {
+
+// These templates are not found via ADL.
+using hwy::HWY_NAMESPACE::Add;
+using hwy::HWY_NAMESPACE::ShiftRight;
+using hwy::HWY_NAMESPACE::Sub;
 
 template <int transform_type>
 void InvRCTRow(const pixel_type* in0, const pixel_type* in1,
@@ -15,7 +34,38 @@ void InvRCTRow(const pixel_type* in0, const pixel_type* in1,
                 "Invalid transform type");
   int second = transform_type >> 1;
   int third = transform_type & 1;
-  for (size_t x = 0; x < w; x++) {
+
+  size_t x = 0;
+  const HWY_FULL(pixel_type) d;
+  const size_t N = Lanes(d);
+  for (; x + N - 1 < w; x += N) {
+    if (transform_type == 6) {
+      auto Y = Load(d, in0 + x);
+      auto Co = Load(d, in1 + x);
+      auto Cg = Load(d, in2 + x);
+      Y = Sub(Y, ShiftRight<1>(Cg));
+      auto G = Add(Cg, Y);
+      Y = Sub(Y, ShiftRight<1>(Co));
+      auto R = Add(Y, Co);
+      Store(R, d, out0 + x);
+      Store(G, d, out1 + x);
+      Store(Y, d, out2 + x);
+    } else {
+      auto First = Load(d, in0 + x);
+      auto Second = Load(d, in1 + x);
+      auto Third = Load(d, in2 + x);
+      if (third) Third = Add(Third, First);
+      if (second == 1) {
+        Second = Add(Second, First);
+      } else if (second == 2) {
+        Second = Add(Second, ShiftRight<1>(Add(First, Third)));
+      }
+      Store(First, d, out0 + x);
+      Store(Second, d, out1 + x);
+      Store(Third, d, out2 + x);
+    }
+  }
+  for (; x < w; x++) {
     if (transform_type == 6) {
       pixel_type Y = in0[x];
       pixel_type Co = in1[x];
@@ -55,7 +105,7 @@ Status InvRCT(Image& input, size_t begin_c, size_t rct_type, ThreadPool* pool) {
   }
   // Permutation: 0=RGB, 1=GBR, 2=BRG, 3=RBG, 4=GRB, 5=BGR
   int permutation = rct_type / 7;
-  JXL_CHECK(permutation < 6);
+  JXL_ENSURE(permutation < 6);
   // 0-5 values have the low bit corresponding to Third and the high bits
   // corresponding to Second. 6 corresponds to YCoCg.
   //
@@ -78,22 +128,36 @@ Status InvRCT(Image& input, size_t begin_c, size_t rct_type, ThreadPool* pool) {
   constexpr decltype(&InvRCTRow<0>) inv_rct_row[] = {
       InvRCTRow<0>, InvRCTRow<1>, InvRCTRow<2>, InvRCTRow<3>,
       InvRCTRow<4>, InvRCTRow<5>, InvRCTRow<6>};
-  JXL_RETURN_IF_ERROR(RunOnPool(
-      pool, 0, h, ThreadPool::NoInit,
-      [&](const uint32_t task, size_t /* thread */) {
-        const size_t y = task;
-        const pixel_type* in0 = input.channel[m].Row(y);
-        const pixel_type* in1 = input.channel[m + 1].Row(y);
-        const pixel_type* in2 = input.channel[m + 2].Row(y);
-        pixel_type* out0 = input.channel[m + (permutation % 3)].Row(y);
-        pixel_type* out1 =
-            input.channel[m + ((permutation + 1 + permutation / 3) % 3)].Row(y);
-        pixel_type* out2 =
-            input.channel[m + ((permutation + 2 - permutation / 3) % 3)].Row(y);
-        inv_rct_row[custom](in0, in1, in2, out0, out1, out2, w);
-      },
-      "InvRCT"));
+  const auto process_row = [&](const uint32_t task,
+                               size_t /* thread */) -> Status {
+    const size_t y = task;
+    const pixel_type* in0 = input.channel[m].Row(y);
+    const pixel_type* in1 = input.channel[m + 1].Row(y);
+    const pixel_type* in2 = input.channel[m + 2].Row(y);
+    pixel_type* out0 = input.channel[m + (permutation % 3)].Row(y);
+    pixel_type* out1 =
+        input.channel[m + ((permutation + 1 + permutation / 3) % 3)].Row(y);
+    pixel_type* out2 =
+        input.channel[m + ((permutation + 2 - permutation / 3) % 3)].Row(y);
+    inv_rct_row[custom](in0, in1, in2, out0, out1, out2, w);
+    return true;
+  };
+  JXL_RETURN_IF_ERROR(
+      RunOnPool(pool, 0, h, ThreadPool::NoInit, process_row, "InvRCT"));
   return true;
 }
 
+}  // namespace HWY_NAMESPACE
 }  // namespace jxl
+HWY_AFTER_NAMESPACE();
+
+#if HWY_ONCE
+namespace jxl {
+
+HWY_EXPORT(InvRCT);
+Status InvRCT(Image& input, size_t begin_c, size_t rct_type, ThreadPool* pool) {
+  return HWY_DYNAMIC_DISPATCH(InvRCT)(input, begin_c, rct_type, pool);
+}
+
+}  // namespace jxl
+#endif

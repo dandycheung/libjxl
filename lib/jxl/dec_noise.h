@@ -8,29 +8,21 @@
 
 // Noise synthesis. Currently disabled.
 
-#include <stddef.h>
-#include <stdint.h>
+#include <cstddef>
 
-#include "lib/jxl/aux_out_fwd.h"
 #include "lib/jxl/base/status.h"
-#include "lib/jxl/chroma_from_luma.h"
 #include "lib/jxl/dec_bit_reader.h"
-#include "lib/jxl/image.h"
+#include "lib/jxl/dec_cache.h"
+#include "lib/jxl/frame_dimensions.h"
+#include "lib/jxl/frame_header.h"
 #include "lib/jxl/noise.h"
 
 namespace jxl {
 
-// Add a noise to Opsin image, loading generated random noise from `noise_rect`
-// in `noise`.
-void AddNoise(const NoiseParams& noise_params, const Rect& noise_rect,
-              const Image3F& noise, const Rect& opsin_rect,
-              const ColorCorrelationMap& cmap, Image3F* opsin);
-
-void RandomImage3(size_t seed, const Rect& rect, Image3F* JXL_RESTRICT noise);
-
-void Random3Planes(size_t seed, const std::pair<ImageF*, Rect>& plane0,
-                   const std::pair<ImageF*, Rect>& plane1,
-                   const std::pair<ImageF*, Rect>& plane2);
+void PrepareNoiseInput(const PassesDecoderState& dec_state,
+                       const FrameDimensions& frame_dim,
+                       const FrameHeader& frame_header, size_t group_index,
+                       size_t thread);
 
 // Must only call if FrameHeader.flags.kNoise.
 Status DecodeNoise(BitReader* br, NoiseParams* noise_params);

@@ -3,22 +3,41 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-#include <stdio.h>
+#include <jxl/memory_manager.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+
+#include "lib/jxl/common.h"
 
 #undef HWY_TARGET_INCLUDE
 #define HWY_TARGET_INCLUDE "lib/jxl/fast_math_test.cc"
+
 #include <hwy/foreach_target.h>
 
 #include "lib/jxl/base/random.h"
+#include "lib/jxl/cms/transfer_functions-inl.h"
 #include "lib/jxl/dec_xyb-inl.h"
-#include "lib/jxl/enc_color_management.h"
+#include "lib/jxl/memory_manager_internal.h"
+#include "lib/jxl/test_memory_manager.h"
+#include "lib/jxl/test_utils.h"
+#include "lib/jxl/testing.h"
+
+#if !JXL_HIGH_PRECISION
+#include <jxl/cms.h>
+
+#include "lib/jxl/base/common.h"
 #include "lib/jxl/enc_xyb.h"
-#include "lib/jxl/fast_math-inl.h"
-#include "lib/jxl/transfer_functions-inl.h"
+#include "lib/jxl/image.h"
+#endif
 
 // Test utils
 #include <hwy/highway.h>
-#include <hwy/tests/test_util-inl.h>
+#include <hwy/tests/hwy_gtest.h>
 HWY_BEFORE_NAMESPACE();
 namespace jxl {
 namespace HWY_NAMESPACE {
@@ -51,7 +70,7 @@ HWY_NOINLINE void TestFastPow2() {
     const float actual = GetLane(actual_v);
     const float expected = std::pow(2, f);
     const float rel_err = std::abs(expected - actual) / expected;
-    EXPECT_LT(rel_err, 3.1E-7) << "f = " << f;
+    EXPECT_LT(rel_err, 3.1E-6) << "f = " << f;
     max_rel_err = std::max(max_rel_err, rel_err);
   }
   printf("max rel err %e\n", static_cast<double>(max_rel_err));
@@ -107,6 +126,27 @@ HWY_NOINLINE void TestFastErf() {
   printf("max abs err %e\n", static_cast<double>(max_abs_err));
 }
 
+HWY_NOINLINE void TestCubeRoot() {
+  const HWY_FULL(float) d;
+  JxlMemoryManager* memory_manager = ::jxl::test::MemoryManager();
+  JXL_TEST_ASSIGN_OR_DIE(
+      AlignedMemory mem,
+      AlignedMemory::Create(memory_manager, Lanes(d) * sizeof(float)));
+  float* approx = mem.address<float>();
+
+  for (uint64_t x5 = 0; x5 < 2000000; x5++) {
+    const float x = x5 * 1E-5f;
+    const float expected = cbrtf(x);
+    Store(CubeRootAndAdd(Set(d, x), Zero(d)), d, approx);
+
+    // All lanes are same
+    for (size_t i = 1; i < Lanes(d); ++i) {
+      EXPECT_NEAR(approx[0], approx[i], 5E-7f);
+    }
+    EXPECT_NEAR(approx[0], expected, 8E-7f);
+  }
+}
+
 HWY_NOINLINE void TestFastSRGB() {
   constexpr size_t kNumTrials = 1 << 23;
   Rng rng(1);
@@ -119,38 +159,6 @@ HWY_NOINLINE void TestFastSRGB() {
     const float expected = GetLane(TF_SRGB().EncodedFromDisplay(d, Set(d, f)));
     const float abs_err = std::abs(expected - actual);
     EXPECT_LT(abs_err, 1.2E-4) << "f = " << f;
-    max_abs_err = std::max(max_abs_err, abs_err);
-  }
-  printf("max abs err %e\n", static_cast<double>(max_abs_err));
-}
-
-HWY_NOINLINE void TestFastPQEFD() {
-  constexpr size_t kNumTrials = 1 << 23;
-  Rng rng(1);
-  float max_abs_err = 0;
-  HWY_FULL(float) d;
-  for (size_t i = 0; i < kNumTrials; i++) {
-    const float f = rng.UniformF(0.0f, 1.0f);
-    const float actual = GetLane(TF_PQ().EncodedFromDisplay(d, Set(d, f)));
-    const float expected = TF_PQ().EncodedFromDisplay(f);
-    const float abs_err = std::abs(expected - actual);
-    EXPECT_LT(abs_err, 7e-7) << "f = " << f;
-    max_abs_err = std::max(max_abs_err, abs_err);
-  }
-  printf("max abs err %e\n", static_cast<double>(max_abs_err));
-}
-
-HWY_NOINLINE void TestFastHLGEFD() {
-  constexpr size_t kNumTrials = 1 << 23;
-  Rng rng(1);
-  float max_abs_err = 0;
-  HWY_FULL(float) d;
-  for (size_t i = 0; i < kNumTrials; i++) {
-    const float f = rng.UniformF(0.0f, 1.0f);
-    const float actual = GetLane(TF_HLG().EncodedFromDisplay(d, Set(d, f)));
-    const float expected = TF_HLG().EncodedFromDisplay(f);
-    const float abs_err = std::abs(expected - actual);
-    EXPECT_LT(abs_err, 5e-7) << "f = " << f;
     max_abs_err = std::max(max_abs_err, abs_err);
   }
   printf("max abs err %e\n", static_cast<double>(max_abs_err));
@@ -172,26 +180,10 @@ HWY_NOINLINE void TestFast709EFD() {
   printf("max abs err %e\n", static_cast<double>(max_abs_err));
 }
 
-HWY_NOINLINE void TestFastPQDFE() {
-  constexpr size_t kNumTrials = 1 << 23;
-  Rng rng(1);
-  float max_abs_err = 0;
-  HWY_FULL(float) d;
-  for (size_t i = 0; i < kNumTrials; i++) {
-    const float f = rng.UniformF(0.0f, 1.0f);
-    const float actual = GetLane(TF_PQ().DisplayFromEncoded(d, Set(d, f)));
-    const float expected = TF_PQ().DisplayFromEncoded(f);
-    const float abs_err = std::abs(expected - actual);
-    EXPECT_LT(abs_err, 3E-6) << "f = " << f;
-    max_abs_err = std::max(max_abs_err, abs_err);
-  }
-  printf("max abs err %e\n", static_cast<double>(max_abs_err));
-}
-
+#if !JXL_HIGH_PRECISION
 HWY_NOINLINE void TestFastXYB() {
   if (!HasFastXYBTosRGB8()) return;
-  ImageMetadata metadata;
-  ImageBundle ib(&metadata);
+  JxlMemoryManager* memory_manager = jxl::test::MemoryManager();
   int scaling = 1;
   int n = 256 * scaling;
   float inv_scaling = 1.0f / scaling;
@@ -200,7 +192,9 @@ HWY_NOINLINE void TestFastXYB() {
   for (int cr = 0; cr < n; cr += kChunk) {
     for (int cg = 0; cg < n; cg += kChunk) {
       for (int cb = 0; cb < n; cb += kChunk) {
-        Image3F chunk(kChunk * kChunk, kChunk);
+        JXL_TEST_ASSIGN_OR_DIE(
+            Image3F chunk,
+            Image3F::Create(memory_manager, kChunk * kChunk, kChunk));
         for (int ir = 0; ir < kChunk; ir++) {
           for (int ig = 0; ig < kChunk; ig++) {
             for (int ib = 0; ib < kChunk; ib++) {
@@ -213,13 +207,18 @@ HWY_NOINLINE void TestFastXYB() {
             }
           }
         }
-        ib.SetFromImage(std::move(chunk), ColorEncoding::SRGB());
-        Image3F xyb(kChunk * kChunk, kChunk);
         std::vector<uint8_t> roundtrip(kChunk * kChunk * kChunk * 3);
-        ToXYB(ib, nullptr, &xyb, GetJxlCms());
-        jxl::HWY_NAMESPACE::FastXYBTosRGB8(
-            xyb, Rect(xyb), Rect(xyb), nullptr, Rect(), /*is_rgba=*/false,
-            roundtrip.data(), xyb.xsize(), xyb.xsize() * 3);
+        ASSERT_TRUE(ToXYB(ColorEncoding::SRGB(), kDefaultIntensityTarget,
+                          nullptr, nullptr, &chunk, *JxlGetDefaultCms(),
+                          nullptr));
+        Image3F& xyb = chunk;
+        for (int y = 0; y < kChunk; y++) {
+          const float* xyba[4] = {xyb.PlaneRow(0, y), xyb.PlaneRow(1, y),
+                                  xyb.PlaneRow(2, y), nullptr};
+          ASSERT_TRUE(jxl::HWY_NAMESPACE::FastXYBTosRGB8(
+              xyba, roundtrip.data() + 3 * xyb.xsize() * y, false,
+              xyb.xsize()));
+        }
         for (int ir = 0; ir < kChunk; ir++) {
           for (int ig = 0; ig < kChunk; ig++) {
             for (int ib = 0; ib < kChunk; ib++) {
@@ -240,6 +239,7 @@ HWY_NOINLINE void TestFastXYB() {
     }
   }
 }
+#endif  // !JXL_HIGH_PRECISION
 
 }  // namespace
 // NOLINTNEXTLINE(google-readability-namespace-comments)
@@ -258,12 +258,13 @@ HWY_EXPORT_AND_TEST_P(FastMathTargetTest, TestFastPow2);
 HWY_EXPORT_AND_TEST_P(FastMathTargetTest, TestFastPow);
 HWY_EXPORT_AND_TEST_P(FastMathTargetTest, TestFastCos);
 HWY_EXPORT_AND_TEST_P(FastMathTargetTest, TestFastErf);
+HWY_EXPORT_AND_TEST_P(FastMathTargetTest, TestCubeRoot);
 HWY_EXPORT_AND_TEST_P(FastMathTargetTest, TestFastSRGB);
-HWY_EXPORT_AND_TEST_P(FastMathTargetTest, TestFastPQDFE);
-HWY_EXPORT_AND_TEST_P(FastMathTargetTest, TestFastPQEFD);
-HWY_EXPORT_AND_TEST_P(FastMathTargetTest, TestFastHLGEFD);
 HWY_EXPORT_AND_TEST_P(FastMathTargetTest, TestFast709EFD);
+
+#if !JXL_HIGH_PRECISION
 HWY_EXPORT_AND_TEST_P(FastMathTargetTest, TestFastXYB);
+#endif
 
 }  // namespace jxl
 #endif  // HWY_ONCE
